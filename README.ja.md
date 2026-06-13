@@ -116,4 +116,4 @@ python3 flashshare_pc_client.py --ssid "AndroidShare_xxxx" --password "xxxxxxxx"
 
 ## ライセンス / 提供
 
-SMOLT STAGE, K.K. — ZZZ FlashShare
+MIT License — [LICENSE](LICENSE) を参照。

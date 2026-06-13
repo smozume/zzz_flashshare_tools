@@ -116,4 +116,4 @@ The host IP is resolved from the DHCP gateway first (default fallback `192.168.4
 
 ## License / Provided by
 
-SMOLT STAGE, K.K. — ZZZ FlashShare
+MIT License — see [LICENSE](LICENSE).
