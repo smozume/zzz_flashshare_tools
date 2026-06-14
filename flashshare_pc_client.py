@@ -1,21 +1,25 @@
 """
-ZZZ FlashShare — PC子機(クライアント) (macOS / Python 3.9+)
+ZZZ FlashShare — PC client (macOS / Windows, Python 3.9+)
 
-役割逆転版: Androidを親機(ホットスポット)、Macを子機にする。
-macOSはWi-Fi APになれない/不安定なので、Macは「参加する側」に徹する。
+Role-reversed mode: the Android device is the host (hotspot) and the PC is the
+client. macOS/Windows cannot reliably act as a Wi-Fi AP, so the PC only "joins".
 
-フロー:
-  1. BLE central(bleak)で親機(Android)をスキャン → サービスUUIDで発見
-  2. 接続して Wi-Fi資格情報(SSID/PASS/PORT/HOST) を読み取る
-  3. networksetup でその Wi-Fi(AndroidのLocalOnlyHotspot)へ参加
-  4. ファイル送信(POST /flashshare/upload) / 受信(送信箱をポーリングしてGET)
+Flow:
+  1. Scan for the host (Android) over BLE (bleak) using the service UUID
+  2. Connect and read the Wi-Fi credentials (SSID/PASS/PORT/HOST)
+  3. Join that Wi-Fi (Android's LocalOnlyHotspot) via networksetup / netsh
+  4. Send files (POST /flashshare/upload) / receive (poll the outbox and GET)
 
-事前にAndroid側を「親機になる(受信)」にして「接続待機中」にしておくこと。
+Before running, set the Android side to "Become host (receive)" and leave it
+on the "Waiting for connection" screen.
 
-依存: pip install -r requirements.txt   (bleak)
-実行例:
-  python3 flashshare_pc_client.py                 # 受信待ち(送信箱をポーリング)
-  python3 flashshare_pc_client.py --send a.jpg b.pdf   # 送信してから受信待ち
+Dependency: pip install -r requirements.txt   (bleak)
+Examples:
+  python3 flashshare_pc_client.py                      # wait to receive (poll the outbox)
+  python3 flashshare_pc_client.py --send a.jpg b.pdf   # send, then keep receiving
+
+Note: while running, the PC's Wi-Fi is switched to the Android hotspot. On exit
+(including Ctrl+C) the script reconnects to your previous Wi-Fi network.
 """
 from __future__ import annotations
 
@@ -36,7 +40,7 @@ import urllib.request
 
 from bleak import BleakClient, BleakScanner  # type: ignore
 
-# ---- プロトコル定数(Flutter側と一致) -------------------------------------- #
+# ---- Protocol constants (must match the Flutter app) ----------------------- #
 SERVICE_UUID = "7a8b0001-2c3d-4e5f-8a9b-0c1d2e3f4a5b"
 WIFI_CRED_UUID = "7a8b0002-2c3d-4e5f-8a9b-0c1d2e3f4a5b"
 
@@ -51,12 +55,18 @@ IS_WIN = os.name == "nt"
 IS_MAC = sys.platform == "darwin"
 
 
+def _mask(value) -> str:
+    """Mask an identifier for display so full BLE/MAC IDs aren't shown in logs or demo videos."""
+    s = str(value)
+    return f"{s[:8]}…" if len(s) > 8 else s
+
+
 # =========================================================================== #
-# 1) BLE: 親機を発見して資格情報を取得
+# 1) BLE: discover the host and read the credentials
 # =========================================================================== #
 async def find_host(timeout: float = 8.0):
-    """サービスUUIDで親機(Android)をスキャンして返す。見つからなければ None。"""
-    print(f"[ble] 親機をスキャン中… ({timeout:.0f}秒)")
+    """Scan for the host (Android) by service UUID and return matches (or [])."""
+    print(f"[ble] Scanning for host... ({timeout:.0f}s)")
     found = await BleakScanner.discover(timeout=timeout, service_uuids=[SERVICE_UUID], return_adv=True)
     hosts = []
     for address, (device, adv) in found.items():
@@ -69,10 +79,10 @@ async def find_host(timeout: float = 8.0):
 
 
 async def read_credential(device) -> dict:
-    """親機へ接続し、Wi-Fi資格情報(JSON)を読み取る。"""
-    # Windows(WinRT)はGATTサービスをキャッシュする。親機は接続毎にBLEを再構築するため
-    # 古いキャッシュが残ると "Could not get GATT services: Unreachable" になる。
-    # → use_cached_services=False で毎回フレッシュに探索する。
+    """Connect to the host and read the Wi-Fi credentials (JSON)."""
+    # Windows (WinRT) caches GATT services. The host rebuilds its BLE stack on
+    # each connection, so a stale cache causes "Could not get GATT services:
+    # Unreachable". use_cached_services=False forces a fresh discovery each time.
     kwargs = {"winrt": {"use_cached_services": False}} if IS_WIN else {}
     last = None
     for attempt in range(4):
@@ -82,17 +92,17 @@ async def read_credential(device) -> dict:
                 return json.loads(bytes(raw).decode("utf-8"))
         except Exception as e:  # noqa: BLE001
             last = e
-            print(f"[ble] 取得失敗(再試行 {attempt + 1}/4): {e}")
+            print(f"[ble] Read failed (retry {attempt + 1}/4): {e}")
             await asyncio.sleep(1.5)
-    raise RuntimeError(f"資格情報の取得に失敗: {last}")
+    raise RuntimeError(f"Failed to read credentials: {last}")
 
 
 # =========================================================================== #
-# 2) Wi-Fi参加 (macOS: networksetup / Windows: netsh)
+# 2) Join Wi-Fi (macOS: networksetup / Windows: netsh)
 # =========================================================================== #
 def _run(cmd: list[str], timeout: int = 20) -> str:
-    """コマンド実行して標準出力+標準エラーを返す(失敗しても例外にしない)。
-    日本語WindowsのnetshはCP932で出力するため、バイト取得してロケールで復号する。"""
+    """Run a command and return stdout+stderr (never raises).
+    Japanese Windows netsh outputs CP932, so decode bytes with several encodings."""
     try:
         res = subprocess.run(cmd, capture_output=True, timeout=timeout)
         raw = (res.stdout or b"") + (res.stderr or b"")
@@ -107,7 +117,7 @@ def _run(cmd: list[str], timeout: int = 20) -> str:
 
 
 def wifi_device() -> str:
-    """Wi-FiインターフェイスのデバイスID。macOS=en0系, Windows=インターフェイス名。"""
+    """Wi-Fi interface device ID. macOS = en0-style, Windows = interface name."""
     if IS_MAC:
         out = _run(["networksetup", "-listallhardwareports"])
         lines = out.splitlines()
@@ -145,7 +155,7 @@ def current_ssid(dev: str) -> str | None:
 
 
 def ssid_visible(ssid: str) -> bool:
-    """周囲のスキャン結果に指定SSIDが見えているか。"""
+    """Whether the given SSID is visible in the surrounding scan results."""
     if IS_MAC:
         return ssid in _run(["system_profiler", "SPAirPortDataType"], timeout=25)
     if IS_WIN:
@@ -154,7 +164,7 @@ def ssid_visible(ssid: str) -> bool:
 
 
 def resolve_gateway(dev: str) -> str | None:
-    """参加中ネットワークのゲートウェイ(=親機)IPを取得。"""
+    """Get the gateway (= host) IP of the network currently joined."""
     if IS_MAC:
         out = _run(["ipconfig", "getoption", dev, "router"]).strip()
         return out if out.count(".") == 3 else None
@@ -165,13 +175,13 @@ def resolve_gateway(dev: str) -> str | None:
             if "Default Gateway" in line or "デフォルト ゲートウェイ" in line or "ゲートウェイ" in line:
                 val = line.split(":")[-1].strip()
                 if val.count(".") == 3:
-                    gw = val  # 最後に見つかったIPv4(通常Wi-Fiアダプタ)
+                    gw = val  # last IPv4 found (usually the Wi-Fi adapter)
         return gw
     return None
 
 
 def _win_join(ssid: str, password: str) -> bool:
-    """Windows: WPA2プロファイルXMLを生成→追加→接続。"""
+    """Windows: generate a WPA2 profile XML -> add -> connect."""
     import tempfile
     xml = (
         '<?xml version="1.0"?>\n'
@@ -193,19 +203,20 @@ def _win_join(ssid: str, password: str) -> bool:
         f.write(xml)
     try:
         _run(["netsh", "wlan", "add", "profile", f"filename={path}", "user=current"])
-        # netshの成否メッセージは言語(CP932等)で変わり解析が不安定なため、
-        # 「接続要求を出して数秒待つ」だけにし、実際の成否は呼び出し側のpingで判定する。
+        # netsh success/failure messages vary by locale (CP932 etc.) and are hard
+        # to parse reliably, so we just request the connection and wait; the
+        # caller confirms real connectivity with ping().
         for attempt in range(3):
-            print(f"[wifi] '{ssid}' へ接続中… ({attempt + 1}/3)")
+            print(f"[wifi] Connecting to '{ssid}'... ({attempt + 1}/3)")
             out = _run(["netsh", "wlan", "connect", f"name={ssid}", f"ssid={ssid}"])
             if out.strip():
                 print(f"[wifi] netsh: {out.strip()}")
-            time.sleep(4.0)  # 関連付け+DHCP待ち
-            if current_ssid("") == ssid:  # 現在SSIDが一致すれば確実
-                print("[wifi] 接続OK")
+            time.sleep(4.0)  # wait for association + DHCP
+            if current_ssid("") == ssid:  # confirmed if current SSID matches
+                print("[wifi] Connected")
                 return True
-        # 確認できなくても実際は繋がっていることがある(ロケール差)。pingに委ねる。
-        print("[wifi] 接続要求を送信(疎通はこの後確認します)")
+        # Even if unconfirmed it may actually be connected (locale differences).
+        print("[wifi] Connection requested (connectivity is checked next)")
         return True
     finally:
         try:
@@ -215,28 +226,30 @@ def _win_join(ssid: str, password: str) -> bool:
 
 
 def join_wifi(dev: str, ssid: str, password: str) -> bool:
-    """Wi-Fi参加。疎通は呼び出し側の ping で最終確認。"""
-    # Windows: netshはスキャン事前待ち不要。プロファイル追加→接続→pingで判定。
+    """Join Wi-Fi. Connectivity is finally confirmed by the caller's ping()."""
+    # Windows: netsh needs no pre-scan wait. Add profile -> connect -> ping.
     if IS_WIN:
         return _win_join(ssid, password)
 
-    # macOS: SSIDがスキャンに出るまで待ってから参加(出ないと参加が失敗しやすい)。
-    print(f"[wifi] '{ssid}' を探索中…")
+    # macOS: wait until the SSID appears in the scan before joining
+    # (joining tends to fail if it's not yet visible).
+    print(f"[wifi] Looking for '{ssid}'...")
     visible = False
     for i in range(6):
         if ssid_visible(ssid):
             visible = True
             break
-        print(f"[wifi]   スキャン中… ({i + 1}/6)")
+        print(f"[wifi]   scanning... ({i + 1}/6)")
     if not visible:
-        print(f"[wifi] '{ssid}' がスキャンに出ません。")
-        print("[wifi] ヒント: Android本体のWi-FiをOFF(自宅ルータから切断)してから")
-        print("       「親機になる」にすると、ホットスポットが2.4GHzになりMacから見つかります。")
+        print(f"[wifi] '{ssid}' is not appearing in the scan.")
+        print("[wifi] Tip: turn OFF the Android phone's Wi-Fi (disconnect from your")
+        print("       home router) before 'Become host'. The hotspot then runs on")
+        print("       2.4 GHz and becomes discoverable from the Mac.")
 
     subprocess.run(["networksetup", "-setairportpower", dev, "on"], capture_output=True)
     time.sleep(1.0)
     for attempt in range(4):
-        print(f"[wifi] '{ssid}' へ接続中… ({attempt + 1}/4)")
+        print(f"[wifi] Connecting to '{ssid}'... ({attempt + 1}/4)")
         out = _run(["networksetup", "-setairportnetwork", dev, ssid, password])
         low = out.lower()
         if any(k in low for k in ("could not", "failed", "error", "not be found")):
@@ -246,13 +259,13 @@ def join_wifi(dev: str, ssid: str, password: str) -> bool:
         if out.strip():
             print(f"[wifi] {out.strip()}")
         time.sleep(3.0)
-        print("[wifi] 接続要求OK")
+        print("[wifi] Connection requested")
         return True
     return False
 
 
 # =========================================================================== #
-# 3) ファイル送受信 (HTTP)
+# 3) File transfer (HTTP)
 # =========================================================================== #
 def ping(host: str, port: int) -> bool:
     try:
@@ -263,21 +276,21 @@ def ping(host: str, port: int) -> bool:
 
 
 def disconnect_wifi(dev: str, prev: str | None, joined_ssid: str | None) -> None:
-    """終了時にAndroidホットスポットから切断し、可能なら元のWi-Fiへ戻す。"""
+    """On exit, leave the Android hotspot and reconnect to the previous Wi-Fi if possible."""
     if IS_WIN:
         if joined_ssid:
-            _run(["netsh", "wlan", "delete", "profile", f"name={joined_ssid}"])  # 一時プロファイル削除
+            _run(["netsh", "wlan", "delete", "profile", f"name={joined_ssid}"])  # remove temp profile
         if prev:
-            print(f"[wifi] 元のWi-Fi '{prev}' へ復帰中…")
+            print(f"[wifi] Reconnecting to your previous Wi-Fi '{prev}'...")
             _run(["netsh", "wlan", "connect", f"name={prev}"])
         else:
             _run(["netsh", "wlan", "disconnect"])
     elif IS_MAC:
         if prev and prev != joined_ssid:
-            print(f"[wifi] 元のWi-Fi '{prev}' へ復帰中…")
+            print(f"[wifi] Reconnecting to your previous Wi-Fi '{prev}'...")
             _run(["networksetup", "-setairportnetwork", dev, prev])
         else:
-            # 既知ネットワークへ自動再接続させるため電源を入れ直す。
+            # Power-cycle Wi-Fi so it auto-rejoins a known network.
             _run(["networksetup", "-setairportpower", dev, "off"])
             time.sleep(1.0)
             _run(["networksetup", "-setairportpower", dev, "on"])
@@ -305,11 +318,11 @@ def upload(host: str, port: int, filepath: str) -> None:
     resp = conn.getresponse()
     resp.read()
     conn.close()
-    print(f"\r[send] {name}  完了 ({sent} bytes)        ")
+    print(f"\r[send] {name}  done ({sent} bytes)        ")
 
 
 def list_outbox(host: str, port: int):
-    """成功: list、到達不可/エラー: None(=切断検知用に空[]と区別する)。"""
+    """Success: list; unreachable/error: None (distinct from empty [] for disconnect detection)."""
     try:
         with urllib.request.urlopen(f"http://{host}:{port}{OUTBOX_PATH}", timeout=5) as r:
             if r.status != 200:
@@ -329,7 +342,7 @@ def download(host: str, port: int, entry: dict) -> str:
 
 
 class Session:
-    """送信入力スレッドと受信ループで共有する接続状態。"""
+    """Connection state shared between the send-input thread and the receive loop."""
     def __init__(self) -> None:
         self.host: str | None = None
         self.port: int | None = None
@@ -338,16 +351,16 @@ class Session:
 
 
 def receive_loop(host: str, port: int, session: "Session") -> None:
-    """送信箱を監視。親機が約8秒応答しなくなったら戻る(=切断 → 上位で再接続)。"""
-    print(f"[recv] 送信箱を監視中… 受信は {INBOX} に保存")
+    """Watch the outbox. If the host stops responding for ~8s, return (= disconnected -> reconnect above)."""
+    print(f"[recv] Watching the outbox... received files are saved to {INBOX}")
     seen: set[str] = set()
     fails = 0
     while not session.stop:
         entries = list_outbox(host, port)
         if entries is None:
             fails += 1
-            if fails >= 4:  # ~8秒応答なし
-                print("[recv] 親機との接続が切れたようです。")
+            if fails >= 4:  # ~8s with no response
+                print("[recv] The connection to the host seems to have dropped.")
                 return
         else:
             fails = 0
@@ -355,19 +368,19 @@ def receive_loop(host: str, port: int, session: "Session") -> None:
                 if entry["id"] in seen:
                     continue
                 seen.add(entry["id"])
-                print(f"[recv] 受信中: {entry['name']} ({entry['size']} bytes)")
+                print(f"[recv] Receiving: {entry['name']} ({entry['size']} bytes)")
                 try:
                     dest = download(host, port, entry)
-                    print(f"[recv] 保存: {dest}")
+                    print(f"[recv] Saved: {dest}")
                 except Exception as e:  # noqa: BLE001
-                    print(f"[recv] 失敗: {e}")
+                    print(f"[recv] Failed: {e}")
                     seen.discard(entry["id"])
         time.sleep(2.0)
 
 
 def _parse_paths(line: str) -> list[str]:
-    """入力行をファイルパス群に分解(ドラッグ&ドロップやクォートに対応)。
-    Windowsは '\\' を保持するため posix=False で分解しクォートを除去する。"""
+    """Split an input line into file paths (supports drag & drop and quotes).
+    On Windows, keep '\\' by splitting with posix=False and stripping quotes."""
     try:
         parts = shlex.split(line, posix=not IS_WIN)
     except ValueError:
@@ -378,7 +391,7 @@ def _parse_paths(line: str) -> list[str]:
 
 
 def input_send_loop(session: "Session") -> None:
-    """対話送信スレッド: パス入力/ドラッグ&ドロップ → Enter で親機へ送信。'q'で終了。"""
+    """Interactive send thread: type a path / drag & drop -> Enter to send. 'q' to quit."""
     while not session.stop:
         try:
             line = input().strip()
@@ -391,60 +404,61 @@ def input_send_loop(session: "Session") -> None:
             continue
         host, port = session.host, session.port
         if not host or port is None:
-            print("[send] まだ親機に接続していません。接続後にもう一度どうぞ。")
+            print("[send] Not connected to a host yet. Please try again after connecting.")
             continue
         for p in _parse_paths(line):
             if os.path.isfile(p):
                 try:
                     upload(host, port, p)
                 except Exception as e:  # noqa: BLE001
-                    print(f"[send] 送信失敗: {e}")
+                    print(f"[send] Send failed: {e}")
             else:
-                print(f"[send] ファイルがありません: {p}")
+                print(f"[send] File not found: {p}")
 
 
 # =========================================================================== #
-# メイン
+# Main
 # =========================================================================== #
 async def connect_once(args: argparse.Namespace, dev: str):
-    """資格情報を得て(BLE自動 or 手動指定) → Wi-Fi参加 → 疎通確認。成功で host:port。失敗でNone。"""
+    """Get credentials (BLE auto or manual) -> join Wi-Fi -> verify reachability.
+    Returns (host, port, ssid) on success, or None on failure."""
     if args.ssid and args.password:
-        # 手動モード: Androidの親機画面に表示されたSSID/パスを直接指定(BLE不要)。
+        # Manual mode: pass the SSID/password shown on the Android host screen (no BLE).
         ssid, password = args.ssid, args.password
         port = args.port
         gateway = args.gateway or "192.168.49.1"
-        print(f"[main] 手動指定: SSID='{ssid}' PORT={port}")
+        print(f"[main] Manual: SSID='{ssid}' PORT={port}")
     else:
         hosts = await find_host(timeout=args.scan_timeout)
         if not hosts:
             return None
         device, name, rssi = hosts[0]
-        print(f"[main] 親機: {name}  rssi={rssi}  ({device.address})")
+        print(f"[main] Host: {name}  rssi={rssi}  ({_mask(device.address)})")
         try:
             cred = await read_credential(device)
         except Exception as e:  # noqa: BLE001
-            print(f"[main] 資格情報の取得に失敗: {e}")
-            print("[main] ヒント: WindowsでBLEが不安定な場合は、Android画面のSSID/パスを")
-            print("       --ssid \"AndroidShare_xxxx\" --password \"xxxxxxxx\" で手動指定できます。")
+            print(f"[main] Failed to read credentials: {e}")
+            print("[main] Tip: if BLE is unstable on Windows, you can pass the SSID/password")
+            print("       shown on the Android screen with --ssid \"AndroidShare_xxxx\" --password \"xxxxxxxx\".")
             return None
         ssid, password = cred["s"], cred["p"]
         port = int(cred.get("port", 53117))
         gateway = cred.get("h") or "192.168.49.1"
-        print(f"[main] 資格情報: SSID='{ssid}' PORT={port} GATEWAY={gateway}")
+        print(f"[main] Credentials: SSID='{ssid}' PORT={port} GATEWAY={gateway}")
 
     if not join_wifi(dev, ssid, password):
-        print("[main] Wi-Fi参加に失敗しました。SSID/パスワード/電波状況を確認してください。")
+        print("[main] Failed to join Wi-Fi. Check the SSID/password/signal.")
         return None
 
-    # 親機の実IPはDHCPゲートウェイを最優先(親機の自己申告IPは誤ることがある)。
+    # Prefer the DHCP gateway as the host IP (the host's self-reported IP can be wrong).
     for _ in range(6):
         cands = [c for c in (resolve_gateway(dev), gateway, "192.168.49.1") if c]
         for h in dict.fromkeys(cands):
             if ping(h, port):
-                print(f"[main] 親機サーバに到達 OK ({h}:{port})")
+                print(f"[main] Reached host server OK ({h}:{port})")
                 return (h, port, ssid)
         time.sleep(1.5)
-    print(f"[main] 親機サーバに到達できません (:{port})。")
+    print(f"[main] Cannot reach host server (:{port}).")
     return None
 
 
@@ -454,17 +468,17 @@ async def main(args: argparse.Namespace):
     session = Session()
     sent = False
 
-    # 対話送信スレッド(ファイルをドラッグ&ドロップ→Enterで送信)。
+    # Interactive send thread (drag & drop a file -> Enter to send).
     t = threading.Thread(target=input_send_loop, args=(session,), daemon=True)
     t.start()
     print("=" * 60)
-    print("[操作] 親機(Android)へ送るには、ファイルをこのターミナルに")
-    print("       ドラッグ&ドロップ(またはパス入力)して Enter。")
-    print("       受信は自動。終了は 'q' + Enter または Ctrl+C。")
+    print("[how-to] To send to the host (Android), drag & drop a file onto this")
+    print("         terminal (or type a path) and press Enter.")
+    print("         Receiving is automatic. Quit with 'q' + Enter or Ctrl+C.")
     print("=" * 60)
 
-    # 手動指定モードは親機再起動でSSID/パスが変わると再接続不可 → 切断で終了が妥当。
-    # BLEモードは再探索で新しい資格情報を取得できる → 再接続を継続。
+    # Manual mode can't reconnect after a host restart (SSID/pass change) -> exit on disconnect.
+    # BLE mode can re-discover and fetch new credentials -> keep reconnecting.
     manual_mode = bool(args.ssid and args.password)
     exit_on_disconnect = args.exit_on_disconnect or manual_mode
 
@@ -473,63 +487,64 @@ async def main(args: argparse.Namespace):
         while not session.stop:
             target = await connect_once(args, dev)
             if not target:
-                print("[main] 5秒後に親機を再探索します… (Android側を「接続待機中」に)")
+                print("[main] Re-scanning for a host in 5s... (set Android to 'Waiting for connection')")
                 await asyncio.sleep(5)
                 continue
             session.host, session.port, joined_ssid = target
 
-            # 起動引数 --send は初回接続時に一度だけ送信。
+            # The --send argument sends once on the first connection.
             if not sent and args.send:
                 for fp in args.send:
                     if os.path.isfile(fp):
                         upload(session.host, session.port, fp)
                     else:
-                        print(f"[send] ファイルがありません: {fp}")
+                        print(f"[send] File not found: {fp}")
                 sent = True
 
-            # 受信監視(対話送信は別スレッドで並行)。親機が切れたら戻ってくる。
+            # Watch for incoming files (interactive sending runs in another thread).
+            # Returns here if the host disconnects.
             receive_loop(session.host, session.port, session)
             session.host = None
             if session.stop:
                 break
             if exit_on_disconnect:
                 if manual_mode and not args.exit_on_disconnect:
-                    print("[main] 親機が切断されました(手動指定はSSID/パスが変わるため再接続不可)。終了します。")
+                    print("[main] Host disconnected (manual SSID/pass changes on restart -> can't reconnect). Exiting.")
                 else:
-                    print("[main] 親機が切断されました。終了します。")
+                    print("[main] Host disconnected. Exiting.")
                 break
-            print("[main] 親機を再探索します…(BLEで新しい親機を探索)")
+            print("[main] Re-scanning for a host... (looking for a new host over BLE)")
     except KeyboardInterrupt:
         pass
     finally:
         session.stop = True
-        print("\n[main] 終了処理中… (Wi-Fiを切断します)")
+        print("\n[main] Cleaning up... (disconnecting Wi-Fi and restoring your network)")
         try:
             disconnect_wifi(dev, prev, joined_ssid)
         except Exception:  # noqa: BLE001
             pass
-        print("[main] 終了しました。")
+        print("[main] Done.")
 
 
 def _parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="ZZZ FlashShare PC子機 (macOS / Windows)")
-    p.add_argument("--send", nargs="*", help="親機(Android)へ送るファイル")
-    p.add_argument("--no-receive", action="store_true", help="受信(送信箱ポーリング)を行わない")
+    p = argparse.ArgumentParser(description="ZZZ FlashShare PC client (macOS / Windows)")
+    p.add_argument("--send", nargs="*", help="File(s) to send to the host (Android)")
+    p.add_argument("--no-receive", action="store_true", help="Do not poll the outbox for incoming files")
     p.add_argument("--exit-on-disconnect", action="store_true",
-                   help="BLEモードでも親機切断で終了する(手動--ssid指定時は既定で終了)")
-    p.add_argument("--scan-timeout", type=float, default=8.0, help="BLEスキャン秒数")
-    # 手動モード(BLE回避): Android親機画面のSSID/パスを直接指定する。
-    p.add_argument("--ssid", help="手動指定: 親機のWi-Fi名(Android画面に表示)")
-    p.add_argument("--password", help="手動指定: 親機のWi-Fiパスワード(Android画面に表示)")
-    p.add_argument("--port", type=int, default=53117, help="親機サーバのポート(既定53117)")
-    p.add_argument("--gateway", help="手動指定: 親機のIP(省略時はDHCPから自動解決)")
+                   help="Exit on host disconnect even in BLE mode (default when --ssid is used)")
+    p.add_argument("--scan-timeout", type=float, default=8.0, help="BLE scan duration in seconds")
+    # Manual mode (skip BLE): pass the SSID/password shown on the Android host screen.
+    p.add_argument("--ssid", help="Manual: host Wi-Fi name (shown on the Android screen)")
+    p.add_argument("--password", help="Manual: host Wi-Fi password (shown on the Android screen)")
+    p.add_argument("--port", type=int, default=53117, help="Host server port (default 53117)")
+    p.add_argument("--gateway", help="Manual: host IP (auto-resolved from DHCP if omitted)")
     return p.parse_args()
 
 
 if __name__ == "__main__":
     if not (IS_MAC or IS_WIN):
-        print("[warn] このクライアントはmacOS/Windows向けです。")
+        print("[warn] This client is intended for macOS / Windows.")
     try:
         asyncio.run(main(_parse_args()))
     except KeyboardInterrupt:
-        print("\n[main] 中断されました")
+        print("\n[main] Interrupted")

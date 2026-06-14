@@ -1,5 +1,17 @@
-# ZZZ FlashShare Tools — PC client dependencies (Python 3.9+)
-# BLE central only; bleak is the sole runtime dependency.
-#   pip install -r requirements.txt
+# ZZZ FlashShare — PC (Python 3.9+)
+#
+# ■ PC子機(推奨 / macOS・Windows): flashshare_pc_client.py
+#   BLE central のみ。bleak だけでOK(blessは不要)。
+#     pip install bleak
+#
+# ■ PC親機(Windows向き): flashshare_pc.py
+#   BLEペリフェラル(GATTサーバ)に bless が必要。
+#   ※ Windowsの bless は pysetupdi を要求し、PyPIに無いため別途必要:
+#       pip install bleak bless
+#       pip install git+https://github.com/gwangyi/pysetupdi
+#   macOSで親機にするのはインターネット共有の制約で不安定なため非推奨。
 
 bleak>=0.21.0
+
+# 親機(flashshare_pc.py)を使う場合のみ:
+# bless>=0.2.6
